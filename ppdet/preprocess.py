@@ -249,6 +249,23 @@ class PadStride(object):
         im_info['pad_shape'] = padding_im.shape[1:]
         return padding_im, im_info
 
+class Padding(object):
+
+    def __init__(self):
+        pass
+
+    def __call__(self, im, max_h, max_w):
+        """
+        Args:
+            im (np.ndarray): image (np.ndarray)
+            max_h max_w(float): [h w] of padding
+        Returns:
+            im (np.ndarray):  padding image (np.ndarray)
+        """
+        n, c, h, w = im.shape
+        new_im = np.zeros((n,c,max_h,max_w), dtype="float32")
+        new_im[:,:,:h,:w] = im
+        return new_im
 
 def preprocess(im, preprocess_ops):
     # process image by preprocess_ops
