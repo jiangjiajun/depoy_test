@@ -29,7 +29,6 @@ import cv2
 import numpy as np
 import paddle
 import paddle.fluid as fluid
-import script
 from preprocess import preprocess, Resize, Normalize, Permute, PadStride, Padding
 from visualize import visualize_box_mask, lmk2out, bbox2out, mask2out
 from visualize_new import visualize_detection
@@ -206,7 +205,7 @@ class Detector(object):
                     if (shape[3] > max_w):
                         max_w = shape[3]
 
-        print("max h w bathc_size:",max_h, max_w, batch_size)
+        print("max h w batch_size:",max_h, max_w, batch_size)
         # padding
         for input_name in input_names:
             if input_name == "image":
@@ -748,10 +747,10 @@ def main():
         result = detector.batch_predict(image_list)
         print(len(result))
         for i in range(len(result)):
-            print("===",image_list[i],"---------")
+            print("image\t{}\t".format(image_list[i]), len(result[i]))
             for p in result[i]:
-                print(p)
-            visualize_detection(image_list[i],result[i],threshold=FLAGS.threshold,save_dir=FLAGS.output_dir)
+                print("Box({}\t{}\t{}\t{}\t{}\t{}\t{})".format(p['category_id'], p['category'], p['score'], p['bbox'][0], p['bbox'][1], p['bbox'][2], p['bbox'][3]))
+            #visualize_detection(image_list[i],result[i],threshold=FLAGS.threshold,save_dir=FLAGS.output_dir)
         return
 
     #single
