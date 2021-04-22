@@ -180,6 +180,7 @@ class Detector(object):
             preds = self.mask_rcnn_postprocess(
                 res, batch_size, self.config.num_classes,
                 self.mask_head_resolution, self.config.labels)
+
         return preds
 
     def deal_batch_data(self, image_list):
@@ -193,7 +194,6 @@ class Detector(object):
             batch_size += 1
             inputs, im_info = self.preprocess(image)
             for input_name in input_names:
-                print(input_name,"  :input dtype:",inputs[input_name].dtype)
                 if input_name not in new_inputs:
                     new_inputs[input_name] = []
                 new_inputs[input_name].append(inputs[input_name])
@@ -205,15 +205,16 @@ class Detector(object):
                     if (shape[3] > max_w):
                         max_w = shape[3]
 
-        print("max h w batch_size:",max_h, max_w, batch_size)
+        print("max h w bacth_size:",max_h, max_w, batch_size)
         # padding
         for input_name in input_names:
             if input_name == "image":
                 for i in range(batch_size):
                     new_inputs[input_name][i] = Padding()(new_inputs[input_name][i], max_h, max_w)
-                new_inputs[input_name] = np.concatenate(new_inputs[input_name], axis=0)
+                dtype = new_inputs[input_name][0].dtype
+                new_inputs[input_name] = np.concatenate(new_inputs[input_name], axis=0).astype(dtype)
             elif input_name == "im_size":
-                new_inputs[input_name] = np.array([[max_h, max_w] for i in range(batch_size)], dtype=new_inputs[input_name][0].dtype)
+                new_inputs[input_name] = np.concatenate(new_inputs[input_name])
             elif input_name == "im_info":
                 for i in range(batch_size):
                     new_inputs[input_name][i][0,:2] = [max_h, max_w]
@@ -294,15 +295,12 @@ class Detector(object):
 
             self.predictor.zero_copy_run()
             output_names = self.predictor.get_output_names()
-            #boxes_tensor = self.predictor.get_output_tensor(output_names[0])
-            #np_boxes = boxes_tensor.copy_to_cpu()
             output_results = list()
             for name in output_names:
                 output_tensor = self.predictor.get_output_tensor(name)
                 output_tensor_lod = output_tensor.lod()
                 output_results.append(
                     [output_tensor.copy_to_cpu(), output_tensor_lod])
-            np.masks = None
             results = self.batch_postprocess(
                            output_results,
                            batch_size=len(image_list),
@@ -742,33 +740,16 @@ def main():
             run_mode=FLAGS.run_mode)
 
     image_list = open(FLAGS.image_list).read().strip().split('\n')
-    if FLAGS.batch_infer:
-        #batch
-        result = detector.batch_predict(image_list)
+    start = 0
+    while start < len(image_list):
+        result = detector.batch_predict(image_list[start : start + FLAGS.batch_size])
         print(len(result))
         for i in range(len(result)):
-            print("image\t{}\t".format(image_list[i]), len(result[i]))
+            print("image\t{}\t".format(image_list[start + i]), len(result[i]))
             for p in result[i]:
                 print("Box({}\t{}\t{}\t{}\t{}\t{}\t{})".format(p['category_id'], p['category'], p['score'], p['bbox'][0], p['bbox'][1], p['bbox'][2], p['bbox'][3]))
             #visualize_detection(image_list[i],result[i],threshold=FLAGS.threshold,save_dir=FLAGS.output_dir)
-        return
-
-    #single
-    for image in image_list:
-        result = detector.predict(image)
-        visualize(image, result, detector.config.labels, output_dir=FLAGS.output_dir, threshold=FLAGS.threshold)
-        result_box = result['boxes']
-        print("image\t{}\t".format(image), len(result_box))
-        for i in range(len(result_box)):
-            clsid = int(result_box[i][0])
-            score = result_box[i][1]
-            xmin = result_box[i][2]
-            ymin = result_box[i][3]
-            xmax = result_box[i][4]
-            ymax = result_box[i][5]
-            w = xmax - xmin
-            h = ymax - ymin
-            print("Box({}\t{}\t{}\t{}\t{}\t{}\t{})".format(clsid, detector.config.labels[clsid], score, xmin, ymin, w, h))
+        start += FLAGS.batch_size
 
 if __name__ == '__main__':
     try:
@@ -819,7 +800,11 @@ if __name__ == '__main__':
         type=ast.literal_eval,
         default=False,
         help="Whether to predict with batch.")
-
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="batch size of predict.")
     FLAGS = parser.parse_args()
     print_arguments(FLAGS)
 
