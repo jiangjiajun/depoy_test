@@ -249,6 +249,23 @@ class PadStride(object):
         im_info['pad_shape'] = padding_im.shape[1:]
         return padding_im, im_info
 
+class Padding(object):
+
+    def __init__(self):
+        pass
+
+    def __call__(self, im, max_h, max_w):
+        """
+        Args:
+            im (np.ndarray): image (np.ndarray)
+            max_h max_w(float): [h w] of padding
+        Returns:
+            im (np.ndarray):  padding image (np.ndarray)
+        """
+        n, c, h, w = im.shape
+        new_im = np.zeros((n,c,max_h,max_w), dtype=im.dtype)
+        new_im[:,:,:h,:w] = im
+        return new_im
 
 def preprocess(im, preprocess_ops):
     # process image by preprocess_ops
@@ -260,8 +277,11 @@ def preprocess(im, preprocess_ops):
     }
     im, im_info = decode_image(im, im_info)
     print("before", im[:, :, 0].mean(), im[:, :, 1].mean(), im[:, :, 2].mean(), im.shape)
+    print("before", im[:, :, 0].std(), im[:, :, 1].std(), im[:, :, 2].std(), im.shape)
     for operator in preprocess_ops:
         im, im_info = operator(im, im_info)
-        print(type(operator), im[:, :, 0].mean(), im[:, :, 1].mean(), im[:, :, 2].mean(), im.shape)
+        print(type(operator),"mean=", im[:, :, 0].mean(), im[:, :, 1].mean(), im[:, :, 2].mean(), im.shape)
+        print(type(operator),"std=", im[:, :, 0].std(), im[:, :, 1].std(), im[:, :, 2].std(), im.shape)
+        print(type(operator),"total_mean=", im.mean(), "total_std:", im.std())
     im = np.array((im, )).astype('float32')
     return im, im_info

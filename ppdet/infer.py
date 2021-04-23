@@ -29,9 +29,9 @@ import cv2
 import numpy as np
 import paddle
 import paddle.fluid as fluid
-import script
-from preprocess import preprocess, Resize, Normalize, Permute, PadStride
-from visualize import visualize_box_mask, lmk2out
+from preprocess import preprocess, Resize, Normalize, Permute, PadStride, Padding
+from visualize import visualize_box_mask, lmk2out, bbox2out, mask2out
+from visualize_new import visualize_detection
 
 # Global dictionary
 SUPPORT_MODELS = {
@@ -83,6 +83,7 @@ class Detector(object):
                 new_op_info['arch'] = self.config.arch
             preprocess_ops.append(eval(op_type)(**new_op_info))
         im, im_info = preprocess(im, preprocess_ops)
+        print("preprocess im_shape:",im.shape)
         inputs = create_inputs(im, im_info, self.config.arch)
         return inputs, im_info
 
@@ -111,8 +112,120 @@ class Detector(object):
             results['masks'] = np_masks
         return results
 
-    def predict(self,
-                image,
+    def yolo_postprocess(self, res, batch_size, num_classes, labels):
+        clsid2catid = dict({i: i for i in range(num_classes)})
+        xywh_results = bbox2out([res], clsid2catid)
+        preds = [[] for i in range(batch_size)]
+        for xywh_res in xywh_results:
+            image_id = xywh_res['image_id']
+            del xywh_res['image_id']
+            xywh_res['category'] = labels[xywh_res['category_id']]
+            preds[image_id].append(xywh_res)
+
+        return preds
+
+    def faster_rcnn_postprocess(self, res, batch_size, num_classes, labels):
+        clsid2catid = dict({i: i for i in range(num_classes)})
+        xywh_results = bbox2out([res], clsid2catid)
+        preds = [[] for i in range(batch_size)]
+        for xywh_res in xywh_results:
+            image_id = xywh_res['image_id']
+            del xywh_res['image_id']
+            xywh_res['category'] = labels[xywh_res['category_id']]
+            preds[image_id].append(xywh_res)
+
+        return preds
+
+    def mask_rcnn_postprocess(self, res, batch_size, num_classes, mask_head_resolution,
+                     labels):
+        clsid2catid = dict({i: i for i in range(num_classes)})
+        xywh_results = bbox2out([res], clsid2catid)
+        segm_results = mask2out([res], clsid2catid, mask_head_resolution)
+        preds = [[] for i in range(batch_size)]
+        import pycocotools.mask as mask_util
+        for index, xywh_res in enumerate(xywh_results):
+            image_id = xywh_res['image_id']
+            del xywh_res['image_id']
+            xywh_res['mask'] = mask_util.decode(segm_results[index][
+                'segmentation'])
+            xywh_res['category'] = labels[xywh_res['category_id']]
+            preds[image_id].append(xywh_res)
+
+        return preds
+
+    def batch_postprocess(self,
+                    results,
+                    batch_size=1,
+                    im_shape=None,
+                    im_info=None):
+        def offset_to_lengths(lod):
+            offset = lod[0]
+            lengths = [
+                offset[i + 1] - offset[i] for i in range(len(offset) - 1)
+            ]
+            return [lengths]
+
+        print("self.config.arch:",self.config.arch)
+        res = {'bbox': (results[0][0], offset_to_lengths(results[0][1])), }
+        res['im_id'] = (np.array([[i] for i in range(batch_size)]).astype('int32'), [[]])
+        if self.config.arch in ["YOLO", ]:
+            preds = self.yolo_postprocess(res, batch_size, self.config.num_classes,
+                                            self.config.labels)
+        elif self.config.arch in ["FasterRCNN","RCNN"]:
+                preds = self.faster_rcnn_postprocess(res, batch_size,
+                                                self.config.num_classes, self.config.labels)
+        elif self.config.arch == "MaskRCNN":
+            res['mask'] = (results[1][0], offset_to_lengths(results[1][1]))
+            res['im_shape'] = (im_shape, [])
+            preds = self.mask_rcnn_postprocess(
+                res, batch_size, self.config.num_classes,
+                self.mask_head_resolution, self.config.labels)
+
+        return preds
+
+    def deal_batch_data(self, image_list):
+        input_names = self.predictor.get_input_names()
+        # get max shape
+        new_inputs = {}
+        max_h = max_w = 0.0
+        batch_size = 0
+        new_im_info = {}
+        for image in image_list:
+            batch_size += 1
+            inputs, im_info = self.preprocess(image)
+            for input_name in input_names:
+                if input_name not in new_inputs:
+                    new_inputs[input_name] = []
+                new_inputs[input_name].append(inputs[input_name])
+                if input_name == "image":
+                    shape = inputs[input_name].shape
+                    print(batch_size," imgs shape:",shape)
+                    if (shape[2] > max_h):
+                        max_h = shape[2]
+                    if (shape[3] > max_w):
+                        max_w = shape[3]
+
+        print("max h w bacth_size:",max_h, max_w, batch_size)
+        # padding
+        for input_name in input_names:
+            if input_name == "image":
+                for i in range(batch_size):
+                    new_inputs[input_name][i] = Padding()(new_inputs[input_name][i], max_h, max_w)
+                dtype = new_inputs[input_name][0].dtype
+                new_inputs[input_name] = np.concatenate(new_inputs[input_name], axis=0).astype(dtype)
+            elif input_name == "im_size":
+                new_inputs[input_name] = np.concatenate(new_inputs[input_name])
+            elif input_name == "im_info":
+                for i in range(batch_size):
+                    new_inputs[input_name][i][0,:2] = [max_h, max_w]
+                new_inputs[input_name] = np.concatenate(new_inputs[input_name])
+            elif input_name == "im_shape":
+                new_inputs[input_name] = np.concatenate(new_inputs[input_name])
+
+        return new_inputs
+
+    def batch_predict(self,
+                image_list,
                 threshold=0.0,
                 warmup=0,
                 repeats=1,
@@ -127,8 +240,10 @@ class Detector(object):
                             MaskRCNN's results include 'masks': np.ndarray:
                             shape:[N, class_num, mask_resolution, mask_resolution]
         '''
-        inputs, im_info = self.preprocess(image)
         np_boxes, np_masks, np_lmk = None, None, None
+        inputs  = self.deal_batch_data(image_list)
+        im_shape = inputs.get("im_shape", None)
+        im_info = inputs.get("im_info", None)
         if self.config.use_python_inference:
             for i in range(warmup):
                 outs = self.executor.run(self.program,
@@ -180,6 +295,90 @@ class Detector(object):
 
             self.predictor.zero_copy_run()
             output_names = self.predictor.get_output_names()
+            output_results = list()
+            for name in output_names:
+                output_tensor = self.predictor.get_output_tensor(name)
+                output_tensor_lod = output_tensor.lod()
+                output_results.append(
+                    [output_tensor.copy_to_cpu(), output_tensor_lod])
+            results = self.batch_postprocess(
+                           output_results,
+                           batch_size=len(image_list),
+                           im_shape=im_shape,
+                           im_info=im_info)
+            return results
+
+    def predict(self,
+                image,
+                threshold=0.0,
+                warmup=0,
+                repeats=1,
+                run_benchmark=False):
+        '''
+        Args:
+            image (str/np.ndarray): path of image/ np.ndarray read by cv2
+            threshold (float): threshold of predicted box' score
+        Returns:
+            results (dict): include 'boxes': np.ndarray: shape:[N,6], N: number of box,
+                            matix element:[class, score, x_min, y_min, x_max, y_max]
+                            MaskRCNN's results include 'masks': np.ndarray:
+                            shape:[N, class_num, mask_resolution, mask_resolution]
+        '''
+        inputs, im_info = self.preprocess(image)
+        np_boxes, np_masks, np_lmk = None, None, None
+        if self.config.use_python_inference:
+            for i in range(warmup):
+                outs = self.executor.run(self.program,
+                                         feed=inputs,
+                                         fetch_list=self.fecth_targets,
+                                         return_numpy=False)
+            t1 = time.time()
+            for i in range(repeats):
+                outs = self.executor.run(self.program,
+                                         feed=inputs,
+                                         fetch_list=self.fecth_targets,
+                                         return_numpy=False)
+            t2 = time.time()
+            ms = (t2 - t1) * 1000.0 / repeats
+            print("Inference: {} ms per batch image".format(ms))
+            np_boxes = np.array(outs[0])
+            if self.config.mask_resolution is not None:
+                np_masks = np.array(outs[1])
+        else:
+            print("im_info--------------:",im_info)
+            input_names = self.predictor.get_input_names()
+            print(type(input_names)," names:",input_names)
+            for i in range(len(input_names)):
+                input_tensor = self.predictor.get_input_tensor(input_names[i])
+                if len(inputs[input_names[i]].shape) == 4:
+                    print("=========", input_names[i], inputs[input_names[i]].shape)
+                else:
+                    print("=========", input_names[i], inputs[input_names[i]])
+                input_tensor.copy_from_cpu(inputs[input_names[i]])
+
+            for i in range(warmup):
+                self.predictor.zero_copy_run()
+                output_names = self.predictor.get_output_names()
+                boxes_tensor = self.predictor.get_output_tensor(output_names[0])
+                np_boxes = boxes_tensor.copy_to_cpu()
+                if self.config.mask_resolution is not None:
+                    masks_tensor = self.predictor.get_output_tensor(
+                        output_names[1])
+                    np_masks = masks_tensor.copy_to_cpu()
+
+                if self.config.with_lmk is not None and self.config.with_lmk == True:
+                    face_index = self.predictor.get_output_tensor(output_names[
+                        1])
+                    landmark = self.predictor.get_output_tensor(output_names[2])
+                    prior_boxes = self.predictor.get_output_tensor(output_names[
+                        3])
+                    np_face_index = face_index.copy_to_cpu()
+                    np_prior_boxes = prior_boxes.copy_to_cpu()
+                    np_landmark = landmark.copy_to_cpu()
+                    np_lmk = [np_face_index, np_landmark, np_prior_boxes]
+
+            self.predictor.zero_copy_run()
+            output_names = self.predictor.get_output_names()
             boxes_tensor = self.predictor.get_output_tensor(output_names[0])
             np_boxes = boxes_tensor.copy_to_cpu()
             np.masks = None
@@ -187,7 +386,7 @@ class Detector(object):
                 masks_tensor = self.predictor.get_output_tensor(
                     output_names[1])
                 np_masks = masks_tensor.copy_to_cpu()
-            return np_boxes
+            #return np_boxes
 
             if self.config.with_lmk is not None and self.config.with_lmk == True:
                 face_index = self.predictor.get_output_tensor(output_names[
@@ -344,6 +543,7 @@ class Config():
         self.use_python_inference = yml_conf['use_python_inference']
         self.min_subgraph_size = yml_conf['min_subgraph_size']
         self.labels = yml_conf['label_list']
+        self.num_classes = len(self.labels)
         self.mask_resolution = None
         if 'mask_resolution' in yml_conf:
             self.mask_resolution = yml_conf['mask_resolution']
@@ -528,7 +728,6 @@ def predict_video(detector, camera_id):
                 break
     writer.release()
 
-
 def main():
     config = Config(FLAGS.model_dir)
     detector = Detector(
@@ -541,23 +740,16 @@ def main():
             run_mode=FLAGS.run_mode)
 
     image_list = open(FLAGS.image_list).read().strip().split('\n')
-    for image in image_list:
-        result = detector.predict(image)
-        print("image\t{}\t".format(image), len(result))
+    start = 0
+    while start < len(image_list):
+        result = detector.batch_predict(image_list[start : start + FLAGS.batch_size])
+        print(len(result))
         for i in range(len(result)):
-            if int(result[i][0]) < 0:
-                continue
-            clsid = int(result[i][0])
-            score = result[i][1]
-            xmin = result[i][2]
-            ymin = result[i][3]
-            xmax = result[i][4]
-            ymax = result[i][5]
-            w = xmax - xmin
-            h = ymax - ymin
-            print("Box({}\t{}\t{}\t{}\t{}\t{}\t{})".format(clsid, detector.config.labels[clsid], score, xmin, ymin, w, h))
-
-
+            print("image\t{}\t".format(image_list[start + i]), len(result[i]))
+            for p in result[i]:
+                print("Box({}\t{}\t{}\t{}\t{}\t{}\t{})".format(p['category_id'], p['category'], p['score'], p['bbox'][0], p['bbox'][1], p['bbox'][2], p['bbox'][3]))
+            #visualize_detection(image_list[i],result[i],threshold=FLAGS.threshold,save_dir=FLAGS.output_dir)
+        start += FLAGS.batch_size
 
 if __name__ == '__main__':
     try:
@@ -603,7 +795,16 @@ if __name__ == '__main__':
         type=str,
         default="output",
         help="Directory of output visualization files.")
-
+    parser.add_argument(
+        "--batch_infer",
+        type=ast.literal_eval,
+        default=False,
+        help="Whether to predict with batch.")
+    parser.add_argument(
+        "--batch_size",
+        type=int,
+        default=1,
+        help="batch size of predict.")
     FLAGS = parser.parse_args()
     print_arguments(FLAGS)
 
